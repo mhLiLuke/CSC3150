@@ -1,0 +1,286 @@
+/*
+思路:
+/proc目录内有当前运行进程的<pid>目录
+/proc/<pid>代表某个进程
+/proc/<pid>/status中:
+    Pid:    该进程的pid
+    PPid:   该进程父进程的pid
+    Name:   该进程的名称
+/proc/<pid>/task/<pid>/children文件内有该进程的子进程的pid目录:
+    child_pid
+/proc/<pid>/task/<other_pid>代表该进程的不同线程，在排列方面可以与子进程并列
+这些线程的ppid也是原本<pid>的父进程
+这些线程的名字各不相同，但在pstree一律显示为原本<pid>的名字
+也就是说直接查看task文件下下的目录个数-1即可
+
+从观察结果来看，pstree显示的顺序是按字母顺序排序的，而大写字母一律优先于小写字母
+
+cat -v
+
+
+-n：按PID而不是按名称对具有相同祖先的进程进行排序。 （数字排序。）
+-A：使用ASCII字符绘制树形结构
+-T：隐藏线程，仅显示进程
+*/
+
+#include <stdio.h>
+#include <unistd.h>
+#include <stdlib.h>
+#include <dirent.h>
+#include <string.h>
+
+#define TASK_COMM_LEN 16 // include/linux/sched.h
+#define MAX_LINK_LEN 16
+#define MAX_STATUS_LEN 25 // "Name:   xxxx" 8+16
+#define MAX_CHLD_PROCESS 50
+
+struct pstree_opts {
+    int is_thread;              //是否为线程
+    int thread_number;          //有几个额外线程
+    int process_number;
+    char name[TASK_COMM_LEN];   //进程名
+    pid_t pid;                  
+    int is_first_child;         //是否为父进程的第一个儿子
+    unsigned char ch[4];        //该进程前面的符号
+    int space[MAX_LINK_LEN];    //└ ├ ┬
+};
+
+int compare_opts(const void *, const void *);
+
+void build_process_tree(struct pstree_opts *);
+
+int main()
+{
+    /*
+    *设定初始pid=1进程
+    */
+    struct pstree_opts po;
+    po.is_thread = 0;
+    po.thread_number = 0;
+    po.pid = 1;
+    po.is_first_child = 1;
+    po.process_number = 1;
+
+    //查找初始进程的进程名
+    char dir_str[50];
+    sprintf(dir_str, "/proc/%d/status", po.pid);
+    FILE *file = fopen(dir_str, "r");
+    char line[MAX_STATUS_LEN];
+    char name[TASK_COMM_LEN];
+    int line_number = 0;
+    memset(po.space, 0, sizeof(po.space));
+
+    //循环为查找别的做准备
+    while (fgets(line, sizeof(line), file)) { 
+        ++line_number;
+        if (line_number == 1) {
+            if (sscanf(line, "Name:\t%s", name) == 1) {
+                strncpy(po.name, name, sizeof(po.name));
+            }
+            break;
+        }
+    }
+
+    fclose(file);
+
+    //开始构建进程数
+    build_process_tree(&po);
+
+    exit(0);
+}
+
+
+// qsort的比较函数，按字典序排列，大写字母优先与所有小写字母
+int compare_opts(const void *a, const void *b) { 
+    const struct pstree_opts *opts_a = (const struct pstree_opts *)a;
+    const struct pstree_opts *opts_b = (const struct pstree_opts *)b;
+    return strcmp(opts_a->name, opts_b->name);
+}
+
+void build_process_tree(struct pstree_opts * po) 
+{
+    // 线程情况
+    if (po->is_thread == 1) {
+        //除父进程的第一个子进程外，其它都需要空格
+        if (po->is_first_child != 1) {    
+            for (int i = 1; i < po->space[0]; ++i) {
+                int flag = 0;
+                int count = po->space[i];
+                if (po->space[i] < 0) {
+                    flag = 1; 
+                    count *= -1;
+                }
+                for (int j = 0; j < count; ++j)
+                    printf(" ");
+                // 凡是不是最后一个符号，均为'│'
+                printf(flag == 1 ? " " : "│"); 
+            }
+            for (int j = 0; j < po->space[po->space[0]]; ++j)
+                printf(" ");
+        }
+        // 最后一个符号
+        printf("%s", po->ch);
+        // 1个额外线程的时候特判，不需要num*[]
+        if (po->thread_number == 1)
+            printf("─{%s}\n", po->name);
+        else 
+            printf("─%d*[{%s}]\n", po->thread_number, po->name);
+        return ;
+    }
+
+    char dir_str[50];  // 目录char[] 
+    int total_count = 0;
+
+    //寻找额外线程数，但额外线程的处理放在后面，目的是让额外线程处于最后一个孩子
+    sprintf(dir_str, "/proc/%d/task", po->pid);
+    DIR *dir = opendir(dir_str);
+    struct dirent *entry;
+    int thread_count = 0;
+    while ((entry = readdir(dir)) != NULL) {
+        //是否是目录
+        if (entry->d_type == DT_DIR) {
+            ++thread_count;
+        }
+    }
+    thread_count -= 3; //  减去自身和'.'和'..'
+
+    closedir(dir);
+
+    //创建子进程数组并清零
+    struct pstree_opts new_po[MAX_CHLD_PROCESS];
+    for (int i = 0; i < MAX_CHLD_PROCESS; ++i) {
+        memset(new_po[i].space, 0, sizeof(new_po[i].space));
+    }
+
+    //寻找子进程
+    sprintf(dir_str, "/proc/%d/task/%d/children", po->pid, po->pid);
+    FILE *main_file = fopen(dir_str, "r");
+    pid_t pid_number;
+    //pid_num表示子进程pid
+    while (fscanf(main_file, "%d", &pid_number) == 1) {
+
+        //查找子进程
+        sprintf(dir_str, "/proc/%d/status", pid_number);
+        FILE *file = fopen(dir_str, "r");
+        char line[MAX_STATUS_LEN];
+        char name[TASK_COMM_LEN];
+        int line_number = 0;
+
+        while (fgets(line, sizeof(line), file)) {
+            ++line_number;
+            if (line_number == 1) {
+                //提取子进程的名字用于字典序排序
+                if (sscanf(line, "Name:\t%s", name) == 1) {
+                    new_po[++total_count].is_thread = 0;
+                    new_po[total_count].pid = pid_number;
+                    new_po[total_count].process_number = 1;
+                    strncpy(new_po[total_count].name, name, sizeof(new_po[total_count].name));
+                    memcpy(new_po[total_count].space, po->space, sizeof(new_po[total_count].space));
+                }
+                break;
+            }
+        }
+
+        fclose(file);
+    }
+
+    fclose(main_file);
+
+    //自身为进程情况，输出自己
+    if (po->is_first_child != 1) {
+        for (int i = 1; i < po->space[0]; ++i) {
+            int flag = 0;
+            int count = po->space[i];
+            if (po->space[i] < 0) {
+                flag = 1; 
+                count *= -1;
+            }
+            for (int j = 0; j < count; ++j)
+                printf(" ");
+            printf(flag == 1 ? " " : "│"); 
+        }
+        for (int j = 0; j < po->space[po->space[0]]; ++j)
+            printf(" ");
+    }
+    printf("%s", po->ch);
+    if (po->pid != 1) 
+        printf("─");
+    if (po->process_number == 1)
+        printf("%s", po->name);
+    else 
+        printf("%d*[%s]", po->process_number, po->name);
+
+    if (total_count + thread_count == 0) {
+        printf("\n");
+        return;
+    }
+    printf("─"); 
+
+    if (total_count != 0)
+        qsort(new_po, total_count+1, sizeof(struct pstree_opts), compare_opts);
+
+    if (thread_count > 0) {
+        new_po[++total_count].is_thread = 1;
+        new_po[total_count].thread_number = thread_count;
+        strncpy(new_po[total_count].name, po->name, sizeof(new_po[total_count].name));
+        memcpy(new_po[total_count].space, po->space, sizeof(new_po[total_count].space));
+    }
+
+
+    int space_len = 0;
+
+    for (int i = 1; i <= total_count; ++i) {
+
+        //算上两边的'─'
+        space_len = strlen(po->name) + 2; 
+        
+        //初始进程没有左边的'─'
+        if (po->pid == 1) 
+            --space_len;
+
+        //只有一个子进程，直接'─'串下去
+        if (total_count == 1) {
+            new_po[i].ch[0] = 0xE2;
+            new_po[i].ch[1] = 0x94;
+            new_po[i].ch[2] = 0x80;
+            new_po[i].ch[3] = 0x00;
+            new_po[i].space[++new_po[i].space[0]] = -1 * space_len;
+            new_po[i].is_first_child = 1;
+        }
+        //多个子进程
+        else {
+            new_po[i].space[++new_po[i].space[0]] = space_len;
+
+            if (i != total_count && strcmp(new_po[i].name, new_po[i+1].name) == 0) {
+                new_po[i+1].process_number += new_po[i].process_number;
+                continue;
+            }
+
+            //第一个子进程
+            if (i == 1) { //'┬'
+                new_po[i].ch[0] = 0xE2;
+                new_po[i].ch[1] = 0x94;
+                new_po[i].ch[2] = 0xAC;
+                new_po[i].ch[3] = 0x00;
+                new_po[i].is_first_child = 1;
+            }
+            //最后一个子进程
+            else if (i == total_count) { //'└'
+                new_po[i].ch[0] = 0xE2;
+                new_po[i].ch[1] = 0x94;
+                new_po[i].ch[2] = 0x94;
+                new_po[i].ch[3] = 0x00;
+                new_po[i].is_first_child = 0;
+            }
+            //中间的子进程
+            else { //'├'
+                new_po[i].ch[0] = 0xE2;
+                new_po[i].ch[1] = 0x94;
+                new_po[i].ch[2] = 0x9C;
+                new_po[i].ch[3] = 0x00;
+                new_po[i].is_first_child = 0;
+            }
+        }
+        build_process_tree(&new_po[i]);
+    }
+}
